@@ -735,6 +735,34 @@ function sameOptionalEnvValue(
   return trimOrUndefined(left) === trimOrUndefined(right)
 }
 
+function serializeProfileContextWindows(
+  modelField: string,
+  maxContextLength: number,
+  activeModel?: string,
+): string {
+  const models = parseModelList(modelField)
+  const configuredModels =
+    models.length > 0 ? models : [getPrimaryModel(modelField)]
+  // A saved /model choice can be valid for the provider catalog without
+  // being listed in profile.model. Include the model that will actually run
+  // so it does not fall back to a different context limit.
+  const selectedModel = trimOrUndefined(activeModel)
+  const contextModels = selectedModel
+    ? [...new Set([...configuredModels, selectedModel])]
+    : configuredModels
+
+  return JSON.stringify(
+    Object.fromEntries(
+      // Match resolveModelRuntimeLimits' query-stripped lookup key without
+      // changing case, [1m] tags, or the raw model selection and its options.
+      contextModels.map(model => [
+        model.split('?', 1)[0]?.trim() || model,
+        maxContextLength,
+      ]),
+    ),
+  )
+}
+
 function isProcessEnvAlignedWithProfile(
   processEnv: NodeJS.ProcessEnv,
   profile: ProviderProfile,
@@ -850,9 +878,11 @@ function isProcessEnvAlignedWithProfile(
   }
 
   const expectedContextWindows = profile.maxContextLength
-    ? JSON.stringify({
-        [primaryModel]: profile.maxContextLength,
-      })
+    ? serializeProfileContextWindows(
+        profile.model,
+        profile.maxContextLength,
+        primaryModel,
+      )
     : undefined
   const isAimlapiRoute =
     profile.provider === 'aimlapi' ||
@@ -1281,9 +1311,12 @@ export function applyProviderProfileToProcessEnv(
       openAIProfileEnv.NVIDIA_NIM = '1'
     }
     if (profile.maxContextLength) {
-      openAIProfileEnv.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS = JSON.stringify({
-        [primaryModel]: profile.maxContextLength,
-      })
+      openAIProfileEnv.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS =
+        serializeProfileContextWindows(
+          profile.model,
+          profile.maxContextLength,
+          primaryModel,
+        )
     }
 
     profileEnv = openAIProfileEnv
@@ -1599,6 +1632,13 @@ function buildOpenAICompatibleStartupEnv(
       processEnv: {},
     })
     if (strictEnv) {
+      if (activeProfile.maxContextLength) {
+        strictEnv.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS =
+          serializeProfileContextWindows(
+            activeProfile.model,
+            activeProfile.maxContextLength,
+          )
+      }
       if (isAimlapiProfile) {
         strictEnv.AIMLAPI_API_KEY = activeProfile.apiKey
         strictEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID = 'aimlapi'
@@ -1657,9 +1697,10 @@ function buildOpenAICompatibleStartupEnv(
     ...(activeProfile.authHeaderValue ? { OPENAI_AUTH_HEADER_VALUE: activeProfile.authHeaderValue } : {}),
     ...(activeProfile.maxContextLength
       ? {
-          CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS: JSON.stringify({
-            [getPrimaryModel(activeProfile.model)]: activeProfile.maxContextLength,
-          }),
+          CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS: serializeProfileContextWindows(
+            activeProfile.model,
+            activeProfile.maxContextLength,
+          ),
         }
       : {}),
   }

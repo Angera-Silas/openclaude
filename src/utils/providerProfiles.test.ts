@@ -2139,24 +2139,37 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(getFreshAPIProvider()).not.toBe('xai')
   })
 
-  test('openai-compatible profile applies maxContextLength env override', async () => {
+  test('openai-compatible profile applies maxContextLength to every configured model', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
+    const { resolveModelRuntimeLimits } = await import(
+      '../integrations/runtimeMetadata.js'
+    )
 
     applyProviderProfileToProcessEnv(
       buildProfile({
         provider: 'custom',
         baseUrl: 'http://localhost:4000/v1',
-        model: 'gpt-4o',
+        model: 'local-large, local-small; local-reasoning',
         maxContextLength: 200_000,
       }),
     )
 
     expect(process.env.OPENAI_BASE_URL).toBe('http://localhost:4000/v1')
-    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.OPENAI_MODEL).toBe('local-large')
     expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBe(
-      JSON.stringify({ 'gpt-4o': 200_000 }),
+      JSON.stringify({
+        'local-large': 200_000,
+        'local-small': 200_000,
+        'local-reasoning': 200_000,
+      }),
     )
+    expect(
+      resolveModelRuntimeLimits({
+        model: 'local-small',
+        processEnv: process.env,
+      }).contextWindow,
+    ).toBe(200_000)
   })
 
   test('openai-compatible profile switch clears previous same-model context override', async () => {
@@ -2977,34 +2990,87 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
   })
 
-  test('uses saved valid Hicap /model choice when rehydrating active profile', async () => {
-    const {
-      _setSavedModelOverrideForTesting,
-      applyActiveProviderProfileFromConfig,
-      getProviderProfiles,
-    } = await importFreshProviderProfileModules()
-    _setSavedModelOverrideForTesting('gpt-5.4')
-    const activeProfile = buildProfile({
-      id: 'saved_hicap',
-      provider: 'hicap',
-      baseUrl: 'https://api.hicap.ai/v1',
-      model: 'glm-5.2',
-    })
+  test.each(['', '?reasoning=high', '?thinking=disabled&reasoning=high'])(
+    'preserves context limits for configured and saved models across profile rehydration (%j)',
+    async query => {
+      const {
+        _setSavedModelOverrideForTesting,
+        applyActiveProviderProfileFromConfig,
+        getProviderProfiles,
+      } = await importFreshProviderProfileModules()
+      const { resolveModelRuntimeLimits } = await import(
+        '../integrations/runtimeMetadata.js'
+      )
+      const configuredModel = `gpt-5.2${query}`
+      const savedModel = `gpt-5.4${query}`
+      const modelList = `glm-5.2; ${configuredModel}`
+      _setSavedModelOverrideForTesting(savedModel)
+      const activeProfile = buildProfile({
+        id: 'saved_hicap',
+        provider: 'hicap',
+        baseUrl: 'https://api.hicap.ai/v1',
+        model: modelList,
+        maxContextLength: 200_000,
+      })
+      const config = {
+        providerProfiles: [activeProfile],
+        activeProviderProfileId: activeProfile.id,
+      } as any
+      const expectedContextWindows = JSON.stringify({
+        'glm-5.2': 200_000,
+        'gpt-5.2': 200_000,
+        'gpt-5.4': 200_000,
+      })
 
-    const applied = applyActiveProviderProfileFromConfig({
-      providerProfiles: [activeProfile],
-      activeProviderProfileId: activeProfile.id,
-    } as any)
+      const applied = applyActiveProviderProfileFromConfig(config)
 
-    expect(applied?.id).toBe(activeProfile.id)
-    expect(process.env.OPENAI_BASE_URL).toBe('https://api.hicap.ai/v1')
-    expect(process.env.OPENAI_MODEL).toBe('gpt-5.4')
-    const saved = getProviderProfiles({
-      providerProfiles: [activeProfile],
-      activeProviderProfileId: activeProfile.id,
-    } as any).find((profile: ProviderProfile) => profile.id === activeProfile.id)
-    expect(saved?.model).toBe('glm-5.2')
-  })
+      expect(applied?.id).toBe(activeProfile.id)
+      expect(process.env.OPENAI_BASE_URL).toBe('https://api.hicap.ai/v1')
+      const expectProfileContextLimits = () => {
+        expect(process.env.OPENAI_MODEL).toBe(savedModel)
+        for (const model of [
+          'glm-5.2',
+          'gpt-5.2',
+          'gpt-5.4',
+          configuredModel,
+          savedModel,
+        ]) {
+          expect(
+            resolveModelRuntimeLimits({ model, processEnv: process.env }).contextWindow,
+          ).toBe(200_000)
+        }
+        expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBe(
+          expectedContextWindows,
+        )
+        const saved = getProviderProfiles(config).find(
+          (profile: ProviderProfile) => profile.id === activeProfile.id,
+        )
+        expect(saved?.model).toBe(modelList)
+      }
+      expectProfileContextLimits()
+
+      expect(applyActiveProviderProfileFromConfig(config)?.id).toBe(activeProfile.id)
+      expectProfileContextLimits()
+
+      // Alignment must repair the old configured-only map, even though the
+      // effective model and all other profile-managed environment values match.
+      process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS = JSON.stringify({
+        'glm-5.2': 200_000,
+        'gpt-5.2': 200_000,
+      })
+      applyActiveProviderProfileFromConfig(config)
+      expectProfileContextLimits()
+
+      // Also repair a complete map written with the old raw query-bearing keys.
+      process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS = JSON.stringify({
+        'glm-5.2': 200_000,
+        [configuredModel]: 200_000,
+        [savedModel]: 200_000,
+      })
+      applyActiveProviderProfileFromConfig(config)
+      expectProfileContextLimits()
+    },
+  )
 
   test('uses saved Codex /model choice when rehydrating the Codex OAuth profile', async () => {
     // Regression: the Codex OAuth profile is created with a single
@@ -3697,9 +3763,10 @@ describe('setActiveProviderProfile', () => {
         name: 'DeepSeek',
         provider: 'openai',
         baseUrl: 'https://api.deepseek.com/v1',
-        model: 'deepseek-v4-flash, deepseek-v4-pro, deepseek-chat',
+        model: 'deepseek-v4-flash?thinking=disabled, deepseek-v4-pro?reasoning=high, deepseek-chat',
         apiKey: 'sk-deepseek-live',
         apiFormat: 'responses',
+        maxContextLength: 200_000,
       })
 
       saveMockGlobalConfig(current => ({
@@ -3719,12 +3786,57 @@ describe('setActiveProviderProfile', () => {
       expect(persisted.profile).toBe('openai')
       expect(persisted.env).toEqual({
         OPENAI_BASE_URL: 'https://api.deepseek.com/v1',
-        OPENAI_MODEL: 'deepseek-v4-flash',
+        OPENAI_MODEL: 'deepseek-v4-flash?thinking=disabled',
         OPENAI_API_KEY: 'sk-deepseek-live',
+        CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS: JSON.stringify({
+          'deepseek-v4-flash': 200_000,
+          'deepseek-v4-pro': 200_000,
+          'deepseek-chat': 200_000,
+        }),
       })
     } finally {
       process.chdir(originalCwd)
       rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('persists context window for every model in a keyless openai-compatible profile', async () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const openaiProfile = buildProfile({
+        id: 'keyless_multi_model_prof',
+        provider: 'custom',
+        baseUrl: 'http://localhost:4000/v1',
+        model: 'model-a?reasoning=high; Model-B[1m]?thinking=disabled, model-c',
+        maxContextLength: 64_000,
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [openaiProfile],
+      }))
+
+      const result = setActiveProviderProfile('keyless_multi_model_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('keyless_multi_model_prof')
+      expect(persisted.env.OPENAI_MODEL).toBe('model-a?reasoning=high')
+      expect(persisted.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBe(
+        JSON.stringify({
+          'model-a': 64_000,
+          'Model-B[1m]': 64_000,
+          'model-c': 64_000,
+        }),
+      )
+    } finally {
       rmSync(configDir, { recursive: true, force: true })
     }
   })
